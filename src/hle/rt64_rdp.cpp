@@ -206,10 +206,16 @@ namespace RT64 {
                 overlapDetected = true;
             }
         }
-
-        if (overlapDetected && (colorImage.changed || depthImage.changed)) {
+        
+        if (colorImage.changed || depthImage.changed) {
             state->flush();
-            state->submitFramebufferPair(colorImage.changed ? FramebufferPair::FlushReason::SamplingFromColorImage : FramebufferPair::FlushReason::SamplingFromDepthImage);
+
+            if (overlapDetected) {
+                state->submitFramebufferPair(colorImage.changed ? FramebufferPair::FlushReason::SamplingFromColorImage : FramebufferPair::FlushReason::SamplingFromDepthImage);
+            }
+            else {
+                state->submitFramebufferPair(colorImage.changed ? FramebufferPair::FlushReason::ColorImageChanged : FramebufferPair::FlushReason::DepthImageChanged);
+            }
         }
     }
     
