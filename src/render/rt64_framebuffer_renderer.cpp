@@ -13,6 +13,9 @@
 #include "shared/rt64_framebuffer_params.h"
 #include "shared/rt64_raster_params.h"
 
+#include <algorithm>
+#include <unordered_map>
+
 #include "rt64_descriptor_sets.h"
 #include "rt64_render_worker.h"
 
@@ -1472,6 +1475,13 @@ namespace RT64 {
         RenderViewport rawViewportOriginal(0.0f, 0.0f, originalWidth, commonHeight);
         uint32_t vertexTestZFaceIndicesStart = 0;
         int32_t vertexTestZCallIndex = -1;
+
+        struct RectSliceMinMax {
+            int32_t minUlx = INT32_MAX;
+            int32_t maxLrx = INT32_MIN;
+        };
+
+        thread_local std::unordered_map<uint64_t, RectSliceMinMax> rectSliceMinMax;
         for (uint32_t pr = 0; (pr < fbPair.projectionCount) && (globalCallIndex < p.maxGameCall); pr++) {
             const Projection &proj = fbPair.projections[pr];
             const bool perspProj = (proj.type == Projection::Type::Perspective);
@@ -1497,6 +1507,35 @@ namespace RT64 {
 #       endif
             
             const uint16_t viewportOrigin = drawData.viewportOrigins[proj.transformsIndex];
+
+            rectSliceMinMax.clear();
+            if (proj.type == Projection::Type::Rectangle) {
+                rectSliceMinMax.reserve(proj.gameCallCount);
+
+                for (uint32_t i = 0; i < proj.gameCallCount; i++) {
+                    const GameCall &otherCall = proj.gameCalls[i];
+                    const uint32_t otherCycleType = otherCall.callDesc.otherMode.cycleType();
+                    if (otherCycleType == G_CYC_FILL) {
+                        continue;
+                    }
+                    else if (otherCall.callDesc.extendedType != DrawExtendedType::None) {
+                        continue;
+                    }
+
+                    // Only allow merged detection for regular-origin rectangles.
+                    const bool otherRegularOrigins = (otherCall.callDesc.rectLeftOrigin == G_EX_ORIGIN_NONE) && (otherCall.callDesc.rectRightOrigin == G_EX_ORIGIN_NONE);
+                    if (!otherRegularOrigins) {
+                        continue;
+                    }
+
+                    const FixedRect otherRect = fixRect(otherCall.callDesc.rect, fbPair.scissorRect, p.fixRectLR);
+                    const uint64_t sliceKey = (uint64_t(uint32_t(otherRect.uly)) << 32) | uint64_t(uint32_t(otherRect.lry));
+                    RectSliceMinMax &minMax = rectSliceMinMax[sliceKey];
+                    minMax.minUlx = std::min(minMax.minUlx, otherRect.ulx);
+                    minMax.maxLrx = std::max(minMax.maxLrx, otherRect.lrx);
+                }
+            }
+
             for (uint32_t d = 0; (d < proj.gameCallCount) && (globalCallIndex < p.maxGameCall); d++) {
                 const GameCall &call = proj.gameCalls[d];
                 renderIndices.instanceIndex = call.callDesc.callIndex;
@@ -1656,29 +1695,20 @@ namespace RT64 {
                                 tileCopiesUsed = drawData.callTiles[call.callDesc.tileIndex + t].tileCopyUsed;
                             }
 
-                            // HACK: Check if there are any adjacent rectangles on the same height slice and treat them as if they were a single rectangle.
-                            bool coversScissorWidthMerged = false;
-                            int32_t furthestLeft = INT32_MAX;
-                            int32_t furthestRight = INT32_MIN;
-
-                            for (uint32_t i = 0; i < proj.gameCallCount; i++) {
-                                const GameCall& otherCall = proj.gameCalls[i];
-                                const FixedRect otherRect = fixRect(otherCall.callDesc.rect, fbPair.scissorRect, p.fixRectLR);
-
-                                if ((otherRect.uly == fixedRect.uly) && (otherRect.lry == fixedRect.lry)) {
-                                    furthestLeft = fmin(furthestLeft, otherRect.ulx);
-                                    furthestRight = fmax(furthestRight, otherRect.lrx);
-
-                                    if ((furthestLeft <= fbPair.scissorRect.ulx) && (furthestRight >= fbPair.scissorRect.lrx)) {
-                                        coversScissorWidthMerged = true;
-                                        break;
-                                    }
-                                }
-                            }
-
                             // The call's scissor spans the whole width of the framebuffer pair scissor. The rect must not be using extended origins.
                             const bool regularOrigins = (call.callDesc.rectLeftOrigin == G_EX_ORIGIN_NONE) && (call.callDesc.rectRightOrigin == G_EX_ORIGIN_NONE);
                             const bool coversScissorWidth = regularOrigins && (fixedRect.ulx <= fbPair.scissorRect.ulx) && (fixedRect.lrx >= fbPair.scissorRect.lrx);
+
+                            // Check if rectangles on the same height slice cover the full scissor width.
+                            bool coversScissorWidthMerged = false;
+                            if (regularOrigins) {
+                                const uint64_t sliceKey = (uint64_t(uint32_t(fixedRect.uly)) << 32) | uint64_t(uint32_t(fixedRect.lry));
+                                auto it = rectSliceMinMax.find(sliceKey);
+                                if (it != rectSliceMinMax.end()) {
+                                    coversScissorWidthMerged = (it->second.minUlx <= fbPair.scissorRect.ulx) && (it->second.maxLrx >= fbPair.scissorRect.lrx);
+                                }
+                            }
+
                             if (tileCopiesUsed || coversScissorWidth || coversScissorWidthMerged) {
                                 invRatioScale = 1.0f;
                             }
