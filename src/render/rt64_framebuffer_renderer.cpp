@@ -1450,6 +1450,13 @@ namespace RT64 {
         uint32_t vertexTestZFaceIndicesStart = 0;
         int32_t vertexTestZCallIndex = -1;
         RenderViewport viewportClip;
+
+        struct RectSliceMinMax {
+            int32_t minUlx = INT32_MAX;
+            int32_t maxLrx = INT32_MIN;
+        };
+        thread_local std::unordered_map<uint32_t, RectSliceMinMax> rectSliceMinMax;
+
         for (uint32_t pr = 0; (pr < fbPair.projectionCount) && (globalCallIndex < p.maxGameCall); pr++) {
             const Projection &proj = fbPair.projections[pr];
             if (proj.scissorRect.isNull()) {
@@ -1504,6 +1511,33 @@ namespace RT64 {
                 }
 
                 viewportClip = convertViewportRect(viewport.rect(viewportClipRatios), p.resolutionScale, p.fbWidth, projInvRatioScale, extOriginPercentage, 0.0f, viewportOrigin, viewportOrigin);
+            }
+
+            rectSliceMinMax.clear();
+            if (proj.type == Projection::Type::Rectangle) {
+                rectSliceMinMax.reserve(proj.gameCallCount);
+
+                for (uint32_t i = 0; i < proj.gameCallCount; i++) {
+                    const GameCall &otherCall = proj.gameCalls[i];
+                    const uint32_t otherCycleType = otherCall.callDesc.otherMode.cycleType();
+                    if (otherCycleType == G_CYC_FILL) {
+                        continue;
+                    }
+                    else if (otherCall.callDesc.extendedType != DrawExtendedType::None) {
+                        continue;
+                    }
+
+                    // Only allow merged detection for regular-origin rectangles.
+                    const bool otherRegularOrigins = (otherCall.callDesc.rectLeftOrigin == G_EX_ORIGIN_NONE) && (otherCall.callDesc.rectRightOrigin == G_EX_ORIGIN_NONE);
+                    if (!otherRegularOrigins) {
+                        continue;
+                    }
+
+                    const uint64_t sliceKey = (uint64_t(uint32_t(otherCall.callDesc.rect.uly)) << 32) | uint64_t(uint32_t(otherCall.callDesc.rect.lry));
+                    RectSliceMinMax &minMax = rectSliceMinMax[sliceKey];
+                    minMax.minUlx = std::min(minMax.minUlx, otherCall.callDesc.rect.ulx);
+                    minMax.maxLrx = std::max(minMax.maxLrx, otherCall.callDesc.rect.lrx);
+                }
             }
 
             for (uint32_t d = 0; (d < proj.gameCallCount) && (globalCallIndex < p.maxGameCall); d++) {
@@ -1645,7 +1679,16 @@ namespace RT64 {
                             // The call's scissor spans the whole width of the framebuffer pair scissor. The rect must not be using extended origins.
                             const bool regularOrigins = (call.callDesc.rectLeftOrigin == G_EX_ORIGIN_NONE) && (call.callDesc.rectRightOrigin == G_EX_ORIGIN_NONE);
                             const bool coversScissorWidth = regularOrigins && (call.callDesc.rect.ulx <= fbPair.scissorRect.ulx) && (call.callDesc.rect.lrx >= fbPair.scissorRect.lrx);
-                            if (tileCopiesUsed || coversScissorWidth) {
+                            bool coversScissorWidthMerged = false;
+                            if (regularOrigins) {
+                                const uint64_t sliceKey = (uint64_t(uint32_t(call.callDesc.rect.uly)) << 32) | uint64_t(uint32_t(call.callDesc.rect.lry));
+                                const auto minMaxIt = rectSliceMinMax.find(sliceKey);
+                                if (minMaxIt != rectSliceMinMax.end()) {
+                                    const RectSliceMinMax &minMax = minMaxIt->second;
+                                    coversScissorWidthMerged = (minMax.minUlx <= fbPair.scissorRect.ulx) && (minMax.maxLrx >= fbPair.scissorRect.lrx);
+                                }
+                            }
+                            if (tileCopiesUsed || coversScissorWidth || coversScissorWidthMerged) {
                                 invRatioScale = 1.0f;
                             }
                             else {
